@@ -124,8 +124,9 @@ class AudioRecorder: NSObject, ObservableObject {
         
         // Start timer
         recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self else { return }
             Task { @MainActor in
-                self?.recordingDuration += 0.1
+                self.recordingDuration += 0.1
             }
         }
     }
@@ -172,20 +173,22 @@ class AudioRecorder: NSObject, ObservableObject {
 
 extension AudioRecorder: AVAudioRecorderDelegate {
     nonisolated func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
-        Task { @MainActor in
+        Task { @MainActor [weak self] in
+            guard let self else { return }
             if !flag {
-                isRecording = false
-                recordingTimer?.invalidate()
-                recordingTimer = nil
+                self.isRecording = false
+                self.recordingTimer?.invalidate()
+                self.recordingTimer = nil
             }
         }
     }
     
     nonisolated func audioRecorderEncodeErrorDidOccur(_ recorder: AVAudioRecorder, error: Error?) {
-        Task { @MainActor in
-            isRecording = false
-            recordingTimer?.invalidate()
-            recordingTimer = nil
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.isRecording = false
+            self.recordingTimer?.invalidate()
+            self.recordingTimer = nil
         }
     }
 }

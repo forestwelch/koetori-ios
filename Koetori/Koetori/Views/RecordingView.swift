@@ -11,6 +11,7 @@ struct RecordingView: View {
     @State private var showError = false
     @State private var isUploading = false
     @State private var hasRequestedPermission = false
+    @State private var showDebug = false
     
     var body: some View {
         ZStack {
@@ -31,6 +32,17 @@ struct RecordingView: View {
                 MicrophoneSelector(audioRecorder: audioRecorder)
                 
                 Spacer()
+                
+                // BLE debug (collapsible)
+                DisclosureGroup(isExpanded: $showDebug) {
+                    debugSection
+                } label: {
+                    Text("BLE Debug")
+                        .font(.system(size: 13))
+                        .foregroundColor(.textMuted)
+                }
+                .padding(.horizontal, 20)
+                .padding(.bottom, 12)
             }
             
             // Centered content - button stays in same position
@@ -126,6 +138,49 @@ struct RecordingView: View {
         }
     }
     
+    @ViewBuilder
+    private var debugSection: some View {
+        let info = bleManager.debugInfo
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Chunks:")
+                    .foregroundColor(.textMuted)
+                Text("\(info.lastChunksReceived) / \(info.lastChunksExpected)")
+                    .foregroundColor(.textSecondary)
+            }
+            .font(.system(size: 12, design: .monospaced))
+            HStack {
+                Text("Event:")
+                    .foregroundColor(.textMuted)
+                Text(info.lastEvent)
+                    .foregroundColor(.textSecondary)
+            }
+            .font(.system(size: 12, design: .monospaced))
+            if let err = info.lastError {
+                HStack {
+                    Text("Error:")
+                        .foregroundColor(.textMuted)
+                    Text(err)
+                        .foregroundColor(.warning)
+                }
+                .font(.system(size: 12, design: .monospaced))
+            }
+            if let at = info.lastTransferAt {
+                HStack {
+                    Text("At:")
+                        .foregroundColor(.textMuted)
+                    Text(at, style: .time)
+                        .foregroundColor(.textSecondary)
+                }
+                .font(.system(size: 12, design: .monospaced))
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.bgSecondary.opacity(0.6))
+        .cornerRadius(8)
+    }
+    
     private var isBLEReceiving: Bool {
         if case .receiving = bleManager.connectionState { return true }
         return false
@@ -204,6 +259,7 @@ struct RecordingView: View {
             let response = try await APIService.shared.uploadAudio(fileURL: fileURL)
             AudioServicesPlaySystemSound(1057)
             audioRecorder.cleanup()
+            HistoryStore.shared.add(response, source: .mic)
             apiResponse = response
             showResults = true
         } catch {
@@ -220,6 +276,7 @@ struct RecordingView: View {
             let response = try await APIService.shared.uploadAudio(fileURL: fileURL)
             AudioServicesPlaySystemSound(1057)
             try? FileManager.default.removeItem(at: fileURL)
+            HistoryStore.shared.add(response, source: .ble)
             apiResponse = response
             showResults = true
             // Notify M5 so it can show category/confidence

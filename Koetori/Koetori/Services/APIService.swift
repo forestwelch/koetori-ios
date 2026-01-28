@@ -77,10 +77,9 @@ actor APIService {
             throw APIError.emptyResponse
         }
         
-        // Decode response
-        let decoder = JSONDecoder()
+        // Decode response (use static decode to avoid MainActor-isolated conformance in actor)
         do {
-            return try decoder.decode(APIResponse.self, from: data)
+            return try APIResponse.decode(from: data)
         } catch {
             // Print the actual decoding error details
             print("🔴 Decoding Error: \(error)")

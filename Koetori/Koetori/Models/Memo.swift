@@ -1,6 +1,6 @@
 import Foundation
 
-struct Memo: Codable, Identifiable {
+struct Memo: Codable, Identifiable, Sendable {
     let id: String
     let category: Category
     let confidence: Double
@@ -10,7 +10,7 @@ struct Memo: Codable, Identifiable {
     let needsReview: Bool?
     let starred: Bool?
     
-    struct ExtractedData: Codable {
+    struct ExtractedData: Codable, Sendable {
         let title: String?
         let who: [String]?
         let when: String?

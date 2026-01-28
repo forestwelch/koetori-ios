@@ -1,6 +1,6 @@
 import SwiftUI
 
-enum Category: String, Codable, CaseIterable {
+enum Category: String, Codable, CaseIterable, Sendable {
     case media
     case todo
     case reminder

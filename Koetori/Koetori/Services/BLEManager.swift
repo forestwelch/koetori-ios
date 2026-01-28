@@ -2,101 +2,15 @@ import Foundation
 import CoreBluetooth
 import Combine
 
-// MARK: - BLE constants
+// MARK: - Debug info (for UI)
 
-private let serviceUUID = CBUUID(string: "4FAFC201-1FB5-459E-8FCC-C5C9C331914B")
-private let audioCharUUID = CBUUID(string: "BEB5483E-36E1-4688-B7F5-EA07361B26A8")
-private let controlCharUUID = CBUUID(string: "BEB5483E-36E1-4688-B7F5-EA07361B26A9")
-private let statusCharUUID = CBUUID(string: "BEB5483E-36E1-4688-B7F5-EA07361B26AA")
-private let deviceNamePrefix = "Koetori-M5-"
-private let receiveTimeoutSeconds: TimeInterval = 60  // allow ~38s for 30s recording at 50 chunks/s
-private let stragglerWaitSeconds: TimeInterval = 5   // wait for late notifications after END
-private let audioChunkPayloadSize = 510
-
-// MARK: - Thread-safe chunk storage (used from BLE callback without MainActor)
-
-/// Stores audio chunks from BLE. Call from any thread; uses lock. Avoids flooding MainActor with tasks.
-private final class ChunkStorage {
-    private let lock = NSLock()
-    private var chunks: [UInt16: Data] = [:]
-    private var expectedCount: Int?
-    private var sampleRate: Int = 16000
-
-    func reset(sampleRate: Int = 16000) {
-        lock.lock()
-        defer { lock.unlock() }
-        chunks.removeAll(keepingCapacity: true)
-        expectedCount = nil
-        self.sampleRate = sampleRate
-    }
-
-    /// Called from BLE delegate; minimal work, no async. Logs every 50 chunks to avoid flood.
-    func addChunk(_ data: Data) {
-        guard data.count >= 2 else { return }
-        let index = UInt16(data[0]) | (UInt16(data[1]) << 8)
-        let payload = Data(data.dropFirst(2))
-        lock.lock()
-        chunks[index] = payload
-        let total = chunks.count
-        let log = (total == 1 || total % 50 == 0)
-        lock.unlock()
-        if log { print("🔵 BLE: audio chunks received: \(total)") }
-    }
-
-    func setExpected(_ n: Int) {
-        lock.lock()
-        expectedCount = n
-        lock.unlock()
-    }
-
-    func count() -> Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return chunks.count
-    }
-
-    /// Returns (ordered PCM, sampleRate) if all chunks present, else nil. Clears storage on success.
-    func takeIfComplete() -> (pcm: Data, sampleRate: Int)? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let expected = expectedCount, expected > 0, chunks.count >= expected else { return nil }
-        var missing: [UInt16] = []
-        for i in 0..<expected {
-            if chunks[UInt16(i)] == nil { missing.append(UInt16(i)) }
-        }
-        if !missing.isEmpty {
-            return nil
-        }
-        var ordered: [Data] = []
-        for i in 0..<expected {
-            ordered.append(chunks[UInt16(i)]!)
-        }
-        chunks.removeAll()
-        expectedCount = nil
-        let pcm = ordered.reduce(Data(), +)
-        let rate = sampleRate
-        return (pcm, rate)
-    }
-
-    func missingCount(expected: Int) -> Int {
-        lock.lock()
-        defer { lock.unlock() }
-        var n = 0
-        for i in 0..<expected {
-            if chunks[UInt16(i)] == nil { n += 1 }
-        }
-        return n
-    }
-
-    func receivedCount() -> Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return chunks.count
-    }
+struct BLEDebugInfo: Equatable {
+    var lastChunksReceived: Int
+    var lastChunksExpected: Int
+    var lastTransferAt: Date?
+    var lastError: String?
+    var lastEvent: String  // e.g. "END", "timeout", "straggler_fail", "assembled"
 }
-
-// Connection-state storage shared with delegate (written from BLE callback without MainActor)
-private let chunkStorage = ChunkStorage()
 
 // MARK: - Connection state
 
@@ -117,6 +31,7 @@ final class BLEManager: NSObject, ObservableObject {
     @Published private(set) var connectionState: BLEConnectionState = .disconnected
     @Published private(set) var errorMessage: String?
     @Published var showError = false
+    @Published private(set) var debugInfo = BLEDebugInfo(lastChunksReceived: 0, lastChunksExpected: 0, lastTransferAt: nil, lastError: nil, lastEvent: "—")
 
     /// Called when audio has been fully received and assembled into a WAV file URL.
     var onAudioAssembled: ((URL) -> Void)?
@@ -141,7 +56,7 @@ final class BLEManager: NSObject, ObservableObject {
         central.delegate = self
         switch central.state {
         case .poweredOn:
-            central.scanForPeripherals(withServices: [serviceUUID], options: nil)
+            central.scanForPeripherals(withServices: [BLEConstants.serviceUUID], options: nil)
             connectionState = .scanning
             errorMessage = nil
         case .poweredOff, .unauthorized, .unsupported, .resetting:
@@ -189,7 +104,8 @@ final class BLEManager: NSObject, ObservableObject {
         receiveTimeoutWorkItem = nil
         stragglerWorkItem?.cancel()
         stragglerWorkItem = nil
-        chunkStorage.reset()
+        // Reset storage and mark inactive to ignore any chunks still in transit from failed/cancelled session
+        bleChunkStorage.reset(activate: false)
         if case .receiving = connectionState, let name = peripheral?.name {
             connectionState = .connected(name: name)
         }
@@ -203,10 +119,11 @@ final class BLEManager: NSObject, ObservableObject {
             }
         }
         receiveTimeoutWorkItem = item
-        bleQueue.asyncAfter(deadline: .now() + receiveTimeoutSeconds, execute: item)
+        bleQueue.asyncAfter(deadline: .now() + BLEConstants.receiveTimeoutSeconds, execute: item)
     }
 
     private func receiveTimedOut() {
+        debugInfo = BLEDebugInfo(lastChunksReceived: bleChunkStorage.receivedCount(), lastChunksExpected: 0, lastTransferAt: Date(), lastError: "Timeout", lastEvent: "timeout")
         cancelReceive()
         errorMessage = "Recording timed out (no data)"
         showError = true
@@ -215,14 +132,17 @@ final class BLEManager: NSObject, ObservableObject {
     private func handleControlMessage(_ message: String) {
         if message.hasPrefix("START:") {
             print("🔵 BLE: Control START -> expecting audio chunks")
+            // Cancel any pending work and reset storage (clears isActive flag)
             cancelReceive()
             let parts = message.dropFirst(6).split(separator: ":")
             if parts.count >= 2, let rate = Int(parts[1]) {
                 controlStartSampleRate = rate
-                chunkStorage.reset(sampleRate: rate)
+                bleChunkStorage.reset(sampleRate: rate)
             } else {
-                chunkStorage.reset(sampleRate: controlStartSampleRate)
+                bleChunkStorage.reset(sampleRate: controlStartSampleRate)
             }
+            // reset() sets isActive = true, so chunks arriving after START are accepted
+            // Chunks are filtered by expectedCount range once END sets it
             if let name = peripheral?.name {
                 connectionState = .receiving(name: name)
             }
@@ -239,8 +159,9 @@ final class BLEManager: NSObject, ObservableObject {
                 showError = true
                 return
             }
-            chunkStorage.setExpected(total)
-            let have = chunkStorage.receivedCount()
+            bleChunkStorage.setExpected(total)
+            let have = bleChunkStorage.receivedCount()
+            debugInfo = BLEDebugInfo(lastChunksReceived: have, lastChunksExpected: total, lastTransferAt: Date(), lastError: nil, lastEvent: "END")
             print("🔵 BLE: END received, have \(have)/\(total) chunks")
             tryAssembleAndNotify()
             if have < total {
@@ -249,8 +170,9 @@ final class BLEManager: NSObject, ObservableObject {
             return
         }
         if message.hasPrefix("ERROR:") {
-            cancelReceive()
             let err = String(message.dropFirst(6))
+            debugInfo = BLEDebugInfo(lastChunksReceived: bleChunkStorage.receivedCount(), lastChunksExpected: 0, lastTransferAt: Date(), lastError: err, lastEvent: "ERROR")
+            cancelReceive()
             errorMessage = "M5 error: \(err)"
             showError = true
         }
@@ -264,26 +186,29 @@ final class BLEManager: NSObject, ObservableObject {
             }
         }
         stragglerWorkItem = item
-        bleQueue.asyncAfter(deadline: .now() + stragglerWaitSeconds, execute: item)
+        bleQueue.asyncAfter(deadline: .now() + BLEConstants.stragglerWaitSeconds, execute: item)
     }
 
     private func checkStragglersAndAssemble(expected: Int) {
         stragglerWorkItem = nil
-        let have = chunkStorage.receivedCount()
+        let have = bleChunkStorage.receivedCount()
         print("🔵 BLE: straggler check: \(have)/\(expected) chunks")
         if have >= expected {
             tryAssembleAndNotify()
         } else {
-            let missing = chunkStorage.missingCount(expected: expected)
-            print("🔴 BLE: still missing \(missing) chunks after \(Int(stragglerWaitSeconds))s wait")
-            errorMessage = "\(have)/\(expected) chunks received. iOS may be dropping BLE notifications — try moving the phone closer or reducing recording length."
+            let missing = bleChunkStorage.missingCount(expected: expected)
+            let errMsg = "\(have)/\(expected) chunks received"
+            debugInfo = BLEDebugInfo(lastChunksReceived: have, lastChunksExpected: expected, lastTransferAt: Date(), lastError: errMsg, lastEvent: "straggler_fail")
+            print("🔴 BLE: still missing \(missing) chunks after \(Int(BLEConstants.stragglerWaitSeconds))s wait")
+            errorMessage = "\(errMsg). iOS may be dropping BLE notifications — try moving the phone closer or reducing recording length."
             showError = true
             cancelReceive()
         }
     }
 
     private func tryAssembleAndNotify() {
-        guard let result = chunkStorage.takeIfComplete() else { return }
+        guard let result = bleChunkStorage.takeIfComplete() else { return }
+        debugInfo = BLEDebugInfo(lastChunksReceived: (result.pcm.count / 510) + 1, lastChunksExpected: (result.pcm.count + 509) / 510, lastTransferAt: Date(), lastError: nil, lastEvent: "assembled")
         let header = Data.wavHeader(dataSize: result.pcm.count, sampleRate: result.sampleRate)
         let wav = header + result.pcm
         let fileURL = FileManager.default.temporaryDirectory
@@ -322,7 +247,7 @@ extension BLEManager: CBCentralManagerDelegate {
 
     nonisolated func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
         let name = peripheral.name ?? advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? ""
-        guard name.hasPrefix(deviceNamePrefix) else { return }
+        guard name.hasPrefix(BLEConstants.deviceNamePrefix) else { return }
         central.stopScan()
         peripheral.delegate = self
         Task { @MainActor [weak self] in
@@ -337,7 +262,7 @@ extension BLEManager: CBCentralManagerDelegate {
         Task { @MainActor [weak self] in
             self?.connectionState = .connected(name: name)
         }
-        peripheral.discoverServices([serviceUUID])
+        peripheral.discoverServices([BLEConstants.serviceUUID])
     }
 
     nonisolated func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
@@ -360,6 +285,7 @@ extension BLEManager: CBCentralManagerDelegate {
                 self?.errorMessage = "Disconnected during recording"
                 self?.showError = true
             }
+            // cancelReceive() already marks storage inactive, but ensure it's cleared
             self?.cancelReceive()
             self?.connectionState = .disconnected
             self?.startScanning()
@@ -371,8 +297,8 @@ extension BLEManager: CBCentralManagerDelegate {
 
 extension BLEManager: CBPeripheralDelegate {
     nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        guard let svc = peripheral.services?.first(where: { $0.uuid == serviceUUID }) else { return }
-        peripheral.discoverCharacteristics([audioCharUUID, controlCharUUID, statusCharUUID], for: svc)
+        guard let svc = peripheral.services?.first(where: { $0.uuid == BLEConstants.serviceUUID }) else { return }
+        peripheral.discoverCharacteristics([BLEConstants.audioCharUUID, BLEConstants.controlCharUUID, BLEConstants.statusCharUUID], for: svc)
     }
 
     nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
@@ -385,35 +311,38 @@ extension BLEManager: CBPeripheralDelegate {
             return
         }
         print("🔵 BLE: discovered \(chars.count) characteristics")
-        var audio: CBCharacteristic?
-        var control: CBCharacteristic?
-        var status: CBCharacteristic?
+        var foundAudio: CBCharacteristic?
+        var foundControl: CBCharacteristic?
+        var foundStatus: CBCharacteristic?
         for c in chars {
             let uuidStr = c.uuid.uuidString
-            let props = characteristicPropertiesString(c.properties)
+            let props = BLEConstants.characteristicPropertiesString(c.properties)
             print("🔵 BLE:   \(uuidStr) properties=\(props)")
-            if c.uuid == audioCharUUID { audio = c }
-            if c.uuid == controlCharUUID { control = c }
-            if c.uuid == statusCharUUID { status = c }
+            if c.uuid == BLEConstants.audioCharUUID { foundAudio = c }
+            if c.uuid == BLEConstants.controlCharUUID { foundControl = c }
+            if c.uuid == BLEConstants.statusCharUUID { foundStatus = c }
         }
         // Subscribe to notifications – Audio must be enabled for chunk delivery
-        if let a = audio {
+        if let a = foundAudio {
             print("🔵 BLE: enabling notify on AUDIO characteristic \(a.uuid.uuidString)")
             peripheral.setNotifyValue(true, for: a)
         } else {
-            print("🔴 BLE: AUDIO characteristic not found (expected \(audioCharUUID.uuidString))")
+            print("🔴 BLE: AUDIO characteristic not found (expected \(BLEConstants.audioCharUUID.uuidString))")
         }
-        if let c = control {
+        if let c = foundControl {
             print("🔵 BLE: enabling notify on CONTROL characteristic \(c.uuid.uuidString)")
             peripheral.setNotifyValue(true, for: c)
         }
-        if let s = status {
+        if let s = foundStatus {
             peripheral.setNotifyValue(true, for: s)
         }
+        let audioCharToSet = foundAudio
+        let controlCharToSet = foundControl
+        let statusCharToSet = foundStatus
         Task { @MainActor [weak self] in
-            self?.audioChar = audio
-            self?.controlChar = control
-            self?.statusChar = status
+            self?.audioChar = audioCharToSet
+            self?.controlChar = controlCharToSet
+            self?.statusChar = statusCharToSet
         }
     }
 
@@ -423,7 +352,7 @@ extension BLEManager: CBPeripheralDelegate {
             print("🔴 BLE: notify state failed for \(uuidStr): \(err)")
             return
         }
-        let name = characteristic.uuid == audioCharUUID ? "AUDIO" : (characteristic.uuid == controlCharUUID ? "CONTROL" : "STATUS")
+        let name = characteristic.uuid == BLEConstants.audioCharUUID ? "AUDIO" : (characteristic.uuid == BLEConstants.controlCharUUID ? "CONTROL" : "STATUS")
         print("🔵 BLE: notify \(characteristic.isNotifying ? "ON" : "OFF") for \(name) (\(uuidStr))")
     }
 
@@ -433,26 +362,19 @@ extension BLEManager: CBPeripheralDelegate {
             return
         }
         guard let data = characteristic.value else { return }
-        if characteristic.uuid == controlCharUUID {
+        if characteristic.uuid == BLEConstants.controlCharUUID {
             if let msg = String(data: data, encoding: .utf8) {
                 Task { @MainActor in
                     self.handleControlMessage(msg)
                 }
             }
-        } else if characteristic.uuid == audioCharUUID {
+        } else if characteristic.uuid == BLEConstants.audioCharUUID {
             // Store synchronously on callback thread. No Task = no MainActor queue flood, fewer drops.
             // Copy immediately; characteristic.value is a reused buffer.
+            // addChunk() now filters stale chunks internally (checks isActive and expectedCount)
             let dataCopy = Data(data)
-            chunkStorage.addChunk(dataCopy)
+            bleChunkStorage.addChunk(dataCopy)
         }
     }
 }
 
-private func characteristicPropertiesString(_ p: CBCharacteristicProperties) -> String {
-    var s: [String] = []
-    if p.contains(.read) { s.append("Read") }
-    if p.contains(.write) { s.append("Write") }
-    if p.contains(.notify) { s.append("Notify") }
-    if p.contains(.indicate) { s.append("Indicate") }
-    return s.joined(separator: ",")
-}

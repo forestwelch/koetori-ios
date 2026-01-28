@@ -13,6 +13,10 @@ struct RecordButton: View {
             action()
         }) {
             ZStack {
+                // Full circle hit area so first tap always registers (no "load" tap)
+                Color.clear
+                    .frame(width: 240, height: 240)
+                    .contentShape(Circle())
                 // Outer pulsing circle (only when recording)
                 if isRecording {
                     Circle()
@@ -26,7 +30,7 @@ struct RecordButton: View {
                         )
                 }
                 
-                // Main button circle
+                // Main button circle (visual only; hit area is clear circle above)
                 Circle()
                     .fill(
                         LinearGradient(
@@ -50,7 +54,7 @@ struct RecordButton: View {
                 pulseScale = 1.2
             }
         }
-        .onChange(of: isRecording) { newValue in
+        .onChange(of: isRecording) { _, newValue in
             if newValue {
                 pulseScale = 1.2
             } else {

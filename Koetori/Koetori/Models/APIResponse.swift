@@ -1,6 +1,6 @@
 import Foundation
 
-struct APIResponse: Codable {
+struct APIResponse: Codable, Sendable {
     let transcript: String
     let transcriptionId: String
     let memos: [Memo]
@@ -13,5 +13,10 @@ struct APIResponse: Codable {
         case memos
         case duration
         case language
+    }
+    
+    /// Decode from data in a nonisolated context (for use from actors).
+    nonisolated static func decode(from data: Data) throws -> APIResponse {
+        try JSONDecoder().decode(APIResponse.self, from: data)
     }
 }

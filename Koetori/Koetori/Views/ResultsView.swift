@@ -2,8 +2,10 @@ import SwiftUI
 
 struct ResultsView: View {
     let response: APIResponse
-    let onDismiss: () -> Void
-    
+    var onDismiss: (() -> Void)? = nil
+
+    @Environment(\.dismiss) private var dismiss
+
     var body: some View {
         NavigationView {
             ZStack {
@@ -48,7 +50,11 @@ struct ResultsView: View {
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Done") {
-                        onDismiss()
+                        if let onDismiss {
+                            onDismiss()
+                        } else {
+                            dismiss()
+                        }
                     }
                     .foregroundColor(.primary)
                 }
