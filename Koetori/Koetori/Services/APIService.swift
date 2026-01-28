@@ -28,10 +28,14 @@ actor APIService {
         body.append(username.data(using: .utf8)!)
         body.append("\r\n".data(using: .utf8)!)
         
-        // Add audio file
+        // Add audio file (WAV from BLE or M4A from built-in mic)
+        let ext = (fileURL.pathExtension as NSString).lowercased
+        let (filename, contentType) = ext == "wav"
+            ? ("recording.wav", "audio/wav")
+            : ("recording.m4a", "audio/mp4")
         body.append("--\(boundary)\r\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"audio\"; filename=\"recording.m4a\"\r\n".data(using: .utf8)!)
-        body.append("Content-Type: audio/mp4\r\n\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"audio\"; filename=\"\(filename)\"\r\n".data(using: .utf8)!)
+        body.append("Content-Type: \(contentType)\r\n\r\n".data(using: .utf8)!)
         body.append(audioData)
         body.append("\r\n".data(using: .utf8)!)
         

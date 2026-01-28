@@ -3,6 +3,7 @@ import AudioToolbox
 
 struct RecordingView: View {
     @StateObject private var audioRecorder = AudioRecorder()
+    @StateObject private var bleManager = BLEManager.shared
     
     @State private var showResults = false
     @State private var apiResponse: APIResponse?
@@ -16,11 +17,15 @@ struct RecordingView: View {
             Color.bgPrimary.ignoresSafeArea()
             
             VStack(spacing: 4) {
+                // BLE status
+                bleStatusView
+                    .padding(.top, 8)
+                
                 // Title
                 Text("Koetori")
                     .font(.system(size: 72, weight: .ultraLight, design: .default))
                     .foregroundColor(.textPrimary)
-                    .padding(.top, 60)
+                    .padding(.top, 24)
                 
                 // Microphone selector
                 MicrophoneSelector(audioRecorder: audioRecorder)
@@ -41,12 +46,12 @@ struct RecordingView: View {
                 .frame(height: 60)
                 .padding(.bottom, 30)
                 
-                // Record Button - always centered
+                // Record Button - always centered (disabled when BLE receiving or uploading)
                 RecordButton(isRecording: audioRecorder.isRecording) {
                     handleButtonTap()
                 }
-                .disabled(isUploading)
-                .opacity(isUploading ? 0.5 : 1.0)
+                .disabled(isUploading || isBLEReceiving)
+                .opacity((isUploading || isBLEReceiving) ? 0.5 : 1.0)
                 
                 // Fixed height cancel button area
                 ZStack {
@@ -101,8 +106,61 @@ struct RecordingView: View {
             if !hasRequestedPermission {
                 await requestMicrophonePermission()
             }
-            // Update microphone list when view appears
             audioRecorder.updateAvailableMicrophones()
+        }
+        .onAppear {
+            bleManager.onAudioAssembled = { url in
+                Task { await uploadBLEAudio(fileURL: url) }
+            }
+            bleManager.startScanning()
+        }
+        .onDisappear {
+            bleManager.onAudioAssembled = nil
+        }
+        .onChange(of: bleManager.showError) { _, show in
+            if show, let msg = bleManager.errorMessage {
+                errorMessage = msg
+                showError = true
+                bleManager.showError = false
+            }
+        }
+    }
+    
+    private var isBLEReceiving: Bool {
+        if case .receiving = bleManager.connectionState { return true }
+        return false
+    }
+    
+    @ViewBuilder
+    private var bleStatusView: some View {
+        Group {
+            switch bleManager.connectionState {
+            case .disconnected:
+                Text("Searching for device…")
+                    .font(.system(size: 13))
+                    .foregroundColor(.textMuted)
+            case .scanning:
+                Text("Searching for device…")
+                    .font(.system(size: 13))
+                    .foregroundColor(.textMuted)
+            case .connecting:
+                Text("Connecting…")
+                    .font(.system(size: 13))
+                    .foregroundColor(.warning)
+            case .connected(let name):
+                Text("Connected to \(name)")
+                    .font(.system(size: 13))
+                    .foregroundColor(.success)
+            case .receiving(let name):
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .scaleEffect(0.8)
+                        .tint(.white)
+                    Text("Receiving from \(name)")
+                        .font(.system(size: 13))
+                        .foregroundColor(.accent)
+                }
+            }
         }
     }
     
@@ -142,32 +200,40 @@ struct RecordingView: View {
     
     private func uploadAudio(fileURL: URL) async {
         isUploading = true
-        
         do {
             let response = try await APIService.shared.uploadAudio(fileURL: fileURL)
-            
-            // Play success sound
             AudioServicesPlaySystemSound(1057)
-            
-            // Clean up audio file
             audioRecorder.cleanup()
-            
-            // Show results
-            await MainActor.run {
-                apiResponse = response
-                showResults = true
-                isUploading = false
+            apiResponse = response
+            showResults = true
+        } catch {
+            audioRecorder.cleanup()
+            errorMessage = error.localizedDescription
+            showError = true
+        }
+        isUploading = false
+    }
+    
+    private func uploadBLEAudio(fileURL: URL) async {
+        isUploading = true
+        do {
+            let response = try await APIService.shared.uploadAudio(fileURL: fileURL)
+            AudioServicesPlaySystemSound(1057)
+            try? FileManager.default.removeItem(at: fileURL)
+            apiResponse = response
+            showResults = true
+            // Notify M5 so it can show category/confidence
+            if let first = response.memos.first {
+                bleManager.writeToControl("SUCCESS:\(first.category.rawValue):\(Float(first.confidence))")
+            } else {
+                bleManager.writeToControl("SUCCESS:other:0")
             }
         } catch {
-            // Clean up audio file on error
-            audioRecorder.cleanup()
-            
-            await MainActor.run {
-                errorMessage = error.localizedDescription
-                showError = true
-                isUploading = false
-            }
+            try? FileManager.default.removeItem(at: fileURL)
+            errorMessage = error.localizedDescription
+            showError = true
         }
+        isUploading = false
     }
     
     private func requestMicrophonePermission() async {
